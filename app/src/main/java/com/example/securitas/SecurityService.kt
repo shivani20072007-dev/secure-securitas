@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.Location
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.telephony.SmsManager
@@ -19,6 +20,7 @@ import androidx.core.content.ContextCompat
 import com.google.android.gms.location.*
 import kotlinx.coroutines.*
 import org.json.JSONArray
+import java.io.File
 
 class SecurityService : Service() {
 
@@ -33,12 +35,18 @@ class SecurityService : Service() {
     private val smsSentAction = "com.example.securitas.SMS_SENT"
     
     private var missedSwipeCount = 0
+    
+    private var mediaRecorder: MediaRecorder? = null
+    private var audioCheckJob: Job? = null
+    // Adjusted threshold: 15000 was too sensitive (ambient noise), 
+    // 25000 was too high. Trying 21000 for "loud noises only".
+    private val loudnessThreshold = 21000 
 
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val contactName = intent?.getStringExtra("contact_name") ?: "Guardian"
-            if (resultCode == Activity.RESULT_OK) {
-                Toast.makeText(context, "Alert delivered to $contactName", Toast.LENGTH_SHORT).show()
+            if (resultCode != Activity.RESULT_OK) {
+                Log.e("SecurityService", "SMS failed to $contactName")
             }
         }
     }
@@ -47,6 +55,18 @@ class SecurityService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_SHUTDOWN) {
                 escalateAlarm(isLastGasp = true)
+            }
+        }
+    }
+
+    // New Receiver to bring the app to front when screen turns on
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_ON) {
+                val activityIntent = Intent(context, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                }
+                startActivity(activityIntent)
             }
         }
     }
@@ -64,8 +84,10 @@ class SecurityService : Service() {
             registerReceiver(smsSentReceiver, smsFilter)
         }
 
-        val shutdownFilter = IntentFilter(Intent.ACTION_SHUTDOWN)
-        registerReceiver(shutdownReceiver, shutdownFilter)
+        registerReceiver(shutdownReceiver, IntentFilter(Intent.ACTION_SHUTDOWN))
+        
+        // Register for Screen On events
+        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_ON))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -90,6 +112,77 @@ class SecurityService : Service() {
     private fun startMonitoring() {
         requestLocationUpdates()
         missedSwipeCount = 0
+        startAudioMonitoring()
+    }
+
+    private fun startAudioMonitoring() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+
+        try {
+            stopAudioMonitoring()
+            
+            mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }.apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                setOutputFile(File(cacheDir, "temp_audio.3gp").absolutePath)
+                prepare()
+                start()
+            }
+
+            audioCheckJob = serviceScope.launch {
+                while (isActive) {
+                    delay(300)
+                    val amplitude = mediaRecorder?.maxAmplitude ?: 0
+                    if (amplitude > loudnessThreshold) {
+                        Log.d("SecurityService", "Loud noise detected! Amplitude: $amplitude")
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@SecurityService, "DISTRESS NOISE DETECTED!", Toast.LENGTH_SHORT).show()
+                        }
+                        triggerAudioDistressAlarm()
+                        // Longer cooldown after trigger to prevent multiple SMS for one event
+                        delay(15000) 
+                    }
+                }
+            }
+        } catch (e: Exception) { Log.e("SecurityService", "Audio start failed", e) }
+    }
+
+    private fun stopAudioMonitoring() {
+        audioCheckJob?.cancel()
+        audioCheckJob = null
+        try {
+            mediaRecorder?.apply {
+                stop()
+                release()
+            }
+        } catch (e: Exception) { }
+        mediaRecorder = null
+    }
+
+    private fun triggerAudioDistressAlarm() {
+        val contacts = loadContacts()
+        val cops = contacts.filter { it.category == ContactCategory.POLICE }
+        
+        if (cops.isEmpty()) return
+
+        val userLoc = lastLocation
+        val locationLink = if (userLoc != null) {
+            "https://maps.google.com/?q=${userLoc.latitude},${userLoc.longitude}"
+        } else {
+            "Location unavailable"
+        }
+
+        val message = "EMERGENCY, USER UNSAFE, LOUD NOISES DETECTED!!! Location: $locationLink"
+        
+        cops.forEach { contact ->
+            sendSms(contact.number, message, contact.name)
+        }
     }
 
     private fun triggerAlarm(isDisguised: Boolean) {
@@ -113,7 +206,7 @@ class SecurityService : Service() {
         val locationLink = if (userLoc != null) {
             "https://maps.google.com/?q=${userLoc.latitude},${userLoc.longitude}"
         } else {
-            "Location unknown"
+            "Location unavailable"
         }
 
         val message = "I need help. My location: $locationLink"
@@ -127,7 +220,7 @@ class SecurityService : Service() {
 
         serviceScope.launch {
             targets.forEachIndexed { index, contact ->
-                if (index > 0) delay(3000)
+                if (index > 0) delay(4000)
                 sendSms(contact.number, message, contact.name)
             }
         }
@@ -148,11 +241,13 @@ class SecurityService : Service() {
                     ContactCategory.valueOf(obj.getString("category"))
                 ))
             }
-        } catch (e: Exception) { Log.e("SecurityService", "Load failed", e) }
+        } catch (e: Exception) { }
         return list
     }
 
     private fun sendSms(phoneNumber: String, message: String, contactName: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) return
+
         try {
             val subId = SubscriptionManager.getDefaultSmsSubscriptionId()
             val smsManager: SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -170,13 +265,20 @@ class SecurityService : Service() {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
             
-            smsManager.sendTextMessage(phoneNumber, null, message, sentIntent, null)
+            if (message.length > 160) {
+                val parts = smsManager.divideMessage(message)
+                val sentIntents = ArrayList<PendingIntent>()
+                for (i in parts.indices) sentIntents.add(sentIntent)
+                smsManager.sendMultipartTextMessage(phoneNumber, null, parts, sentIntents, null)
+            } else {
+                smsManager.sendTextMessage(phoneNumber, null, message, sentIntent, null)
+            }
         } catch (e: Exception) { Log.e("SecurityService", "SMS Exception", e) }
     }
 
     private fun requestLocationUpdates() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 30000).build()
+            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10000).build()
             fusedLocationClient.requestLocationUpdates(locationRequest, object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
                     lastLocation = result.lastLocation
@@ -187,12 +289,13 @@ class SecurityService : Service() {
 
     private fun stopAlarm() {
         missedSwipeCount = 0
+        stopAudioMonitoring()
         serviceJob.cancelChildren()
     }
 
     private fun createNotification(content: String): Notification {
         val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
         }
         val fullScreenPendingIntent = PendingIntent.getActivity(this, 0, fullScreenIntent, PendingIntent.FLAG_IMMUTABLE)
 
@@ -219,8 +322,12 @@ class SecurityService : Service() {
     }
 
     override fun onDestroy() {
-        unregisterReceiver(smsSentReceiver)
-        unregisterReceiver(shutdownReceiver)
+        stopAudioMonitoring()
+        try { 
+            unregisterReceiver(smsSentReceiver)
+            unregisterReceiver(shutdownReceiver)
+            unregisterReceiver(screenReceiver)
+        } catch (e: Exception) { }
         serviceJob.cancel()
         super.onDestroy()
     }

@@ -29,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -83,15 +84,18 @@ fun MainScreen() {
     val sharedPrefs = remember { context.getSharedPreferences("SecuritasPrefs", Context.MODE_PRIVATE) }
     
     var appStatus by remember { mutableStateOf("Safe") }
-    var countdown by remember { mutableIntStateOf(30) }
+    var timerValue by remember { mutableIntStateOf(sharedPrefs.getInt("timer_setting", 30)) }
+    var countdown by remember { mutableIntStateOf(timerValue) }
     var contacts by remember { mutableStateOf(loadContacts(context)) }
     var showAddContact by remember { mutableStateOf(false) }
     var editingContact by remember { mutableStateOf<Contact?>(null) }
+    var showSettings by remember { mutableStateOf(false) }
 
     val permissionsToRequest = mutableListOf(
         Manifest.permission.ACCESS_FINE_LOCATION,
         Manifest.permission.RECORD_AUDIO,
-        Manifest.permission.SEND_SMS
+        Manifest.permission.SEND_SMS,
+        Manifest.permission.READ_PHONE_STATE
     ).apply {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
@@ -102,7 +106,7 @@ fun MainScreen() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (!permissions.values.all { it }) {
-            Toast.makeText(context, "Safety features require permissions", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, "All permissions are required for background safety logic.", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -113,10 +117,10 @@ fun MainScreen() {
         })
     }
 
-    LaunchedEffect(appStatus) {
+    LaunchedEffect(appStatus, timerValue) {
         if (appStatus == "Awaiting Response") {
             while (appStatus == "Awaiting Response") {
-                countdown = 30
+                countdown = timerValue
                 while (countdown > 0 && appStatus == "Awaiting Response") {
                     delay(1000)
                     countdown--
@@ -129,6 +133,18 @@ fun MainScreen() {
                 }
             }
         }
+    }
+
+    if (showSettings) {
+        TimerSettingsDialog(
+            currentValue = timerValue,
+            onDismiss = { showSettings = false },
+            onSave = { newValue ->
+                timerValue = newValue
+                sharedPrefs.edit().putInt("timer_setting", newValue).apply()
+                showSettings = false
+            }
+        )
     }
 
     if (contacts.isEmpty() || showAddContact || editingContact != null) {
@@ -167,6 +183,9 @@ fun MainScreen() {
             TopAppBar(
                 title = { Text("SECURITAS") },
                 actions = {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    }
                     IconButton(onClick = { showAddContact = true }) {
                         Icon(Icons.Default.Add, contentDescription = "Add Contact")
                     }
@@ -248,7 +267,6 @@ fun MainScreen() {
                 Spacer(modifier = Modifier.height(16.dp))
             }
 
-            // Button fixed at the bottom
             Button(
                 onClick = { 
                     context.startService(Intent(context, SecurityService::class.java).apply { action = "TRIGGER_ALARM" })
@@ -264,6 +282,35 @@ fun MainScreen() {
             }
         }
     }
+}
+
+@Composable
+fun TimerSettingsDialog(currentValue: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+    var textValue by remember { mutableStateOf(currentValue.toString()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Set Timer Duration") },
+        text = {
+            Column {
+                Text("Enter the countdown duration in seconds (e.g., 30):")
+                TextField(
+                    value = textValue,
+                    onValueChange = { if (it.all { char -> char.isDigit() }) textValue = it },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = { 
+                val value = textValue.toIntOrNull() ?: 30
+                onSave(if (value > 0) value else 30)
+            }) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 @Composable
@@ -355,7 +402,7 @@ fun GesturePad(onGestureDetected: (String) -> Unit) {
     var points = remember { mutableStateListOf<Offset>() }
     Box(
         modifier = Modifier
-            .size(220.dp) // Slightly smaller to ensure fit
+            .size(240.dp)
             .background(Color(0xFFF5F5F5), RoundedCornerShape(16.dp))
             .pointerInput(Unit) {
                 detectDragGestures(
